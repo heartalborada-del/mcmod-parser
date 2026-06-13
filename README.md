@@ -7,7 +7,7 @@
 ## 安装
 
 ```bash
-pip install -e .
+pip install mcmod-parser
 ```
 
 ## CLI 使用
