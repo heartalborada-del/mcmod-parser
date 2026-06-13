@@ -1,0 +1,2 @@
+[console_scripts]
+mcmod-parser = mcmod_parser.cli:main
