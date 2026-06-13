@@ -13,7 +13,7 @@ from pathlib import Path
 import click
 
 from mcmod_parser.jar_reader import parse_jar
-from mcmod_parser.models import LoaderType
+from mcmod_parser.models import LoaderType, ModInfo
 from mcmod_parser.scanner import parse_metadata_file, scan_directory
 
 
@@ -52,6 +52,88 @@ OUTPUT_FORMATS = ["json", "table", "text", "csv"]
 LOADER_CHOICES = [lt.value for lt in LoaderType]
 
 _EXT_MAP = {"json": ".json", "csv": ".csv", "table": ".txt", "text": ".txt"}
+
+
+# ---------------------------------------------------------------------------
+# ANSI / click‑style colour helpers
+# ---------------------------------------------------------------------------
+def _c(text: str, fg: str) -> str:
+    """Shorthand for ``click.style(text, fg=fg)``."""
+    return click.style(text, fg=fg)
+
+
+def _format_diff(
+    old_mods: dict[str, ModInfo],
+    new_mods: dict[str, ModInfo],
+    label_a: str,
+    label_b: str,
+) -> list[tuple[str, str | None]]:
+    """Produce a unified diff-like summary of two mod sets.
+
+    Returns a list of ``(line, color_tag)`` tuples where *color_tag*
+    is ``"green"``, ``"red"``, or ``None`` (no colour).  Callers can
+    render the list with ``click.style`` or write it out plain.
+    """
+    all_ids = sorted(set(old_mods) | set(new_mods))
+    if not all_ids:
+        return [("Both directories contain no mods.", None)]
+
+    width = max(len(mid) for mid in all_ids) if all_ids else 20
+    result: list[tuple[str, str | None]] = []
+
+    added_count = 0
+    removed_count = 0
+    changed_count = 0
+
+    for mid in all_ids:
+        old = old_mods.get(mid)
+        new = new_mods.get(mid)
+
+        if old is None and new is not None:
+            added_count += 1
+            result.append((f"+ {mid:<{width}}  {new.version}  {new.display_name}", "green"))
+        elif new is None and old is not None:
+            removed_count += 1
+            result.append((f"- {mid:<{width}}  {old.version}  {old.display_name}", "red"))
+        elif old is not None and new is not None and old.version != new.version:
+            changed_count += 1
+            result.append((f"- {mid:<{width}}  {old.version}  {old.display_name}", "red"))
+            result.append((f"+ {mid:<{width}}  {new.version}  {new.display_name}", "green"))
+
+    unchanged = sum(
+        1 for mid in all_ids
+        if old_mods.get(mid) is not None
+        and new_mods.get(mid) is not None
+        and old_mods[mid].version == new_mods[mid].version
+    )
+
+    header_lines = [
+        (f"--- {label_a}", "yellow"),
+        (f"+++ {label_b}", "yellow"),
+        (f"{'─' * 60}", None),
+    ]
+    summary_lines = [
+        ("", None),
+        (f"{'─' * 60}", None),
+        (f"  +{added_count} added  -{removed_count} removed  "
+         f"~{changed_count} changed  ={unchanged} unchanged", None),
+    ]
+
+    return header_lines + result + summary_lines
+
+
+def _render_diff(
+    diff_items: list[tuple[str, str | None]],
+    colored: bool = True,
+) -> str:
+    """Render diff items to a string, with optional colour."""
+    lines: list[str] = []
+    for text, color in diff_items:
+        if colored and color:
+            lines.append(_c(text, color))
+        else:
+            lines.append(text)
+    return "\n".join(lines)
 
 
 def _format_table(mods: list) -> str:
@@ -282,6 +364,72 @@ def scan(directory: str, output: str, output_file: str | None, recursive: bool, 
         sys.exit(1)
 
     _output(mods, output, output_file, source=Path(directory))
+
+
+@main.command()
+@click.argument("dir_a", type=click.Path(exists=True, file_okay=False))
+@click.argument("dir_b", type=click.Path(exists=True, file_okay=False))
+@click.option(
+    "--recursive", "-r",
+    is_flag=True,
+    default=False,
+    help="Scan subdirectories recursively.",
+)
+@click.option(
+    "--loader", "-l",
+    type=click.Choice(LOADER_CHOICES),
+    default=None,
+    help="Only compare mods of a specific loader type.",
+)
+@click.option(
+    "--output-file", "-f",
+    type=click.Path(writable=True),
+    default=None,
+    help="Write diff to a file (without colours). '-f' alone auto-names.",
+)
+@click.option(
+    "--no-color", "--no-ansi",
+    "no_color",
+    is_flag=True,
+    default=False,
+    help="Disable ANSI colour output.",
+)
+def diff(
+    dir_a: str,
+    dir_b: str,
+    recursive: bool,
+    loader: str | None,
+    output_file: str | None,
+    no_color: bool,
+) -> None:
+    """Compare mods in DIR_A vs DIR_B.
+
+    Shows added (+), removed (-), and version-changed (~) mods.
+    """
+    filter_type = LoaderType(loader) if loader else None
+
+    try:
+        mods_a = scan_directory(dir_a, recursive=recursive, filter_loader=filter_type)
+        mods_b = scan_directory(dir_b, recursive=recursive, filter_loader=filter_type)
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    old_map: dict[str, ModInfo] = {m.mod_id: m for m in mods_a}
+    new_map: dict[str, ModInfo] = {m.mod_id: m for m in mods_b}
+
+    plain = _format_diff(old_map, new_map, dir_a, dir_b)
+
+    if output_file is not None:
+        resolved = _resolve_output_path(output_file, "text", source=Path(dir_b))
+        if resolved:
+            content = _render_diff(plain, colored=False)
+            resolved.write_text(content, encoding="utf-8")
+            click.echo(f"Saved to {resolved}")
+        else:
+            click.echo(_render_diff(plain, colored=not no_color))
+    else:
+        click.echo(_render_diff(plain, colored=not no_color))
 
 
 if __name__ == "__main__":

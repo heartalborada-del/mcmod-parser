@@ -3,10 +3,12 @@
 import io
 import json
 import zipfile
+from pathlib import Path
 
 from click.testing import CliRunner
 
-from mcmod_parser.cli import main
+from mcmod_parser.cli import main, _format_diff, _render_diff
+from mcmod_parser.models import LoaderType, ModInfo
 
 
 class TestCLIParse:
@@ -462,3 +464,207 @@ class TestPreprocessArgv:
         cli._preprocess_argv()
         # -f followed by -r (another option) → bare -f → -f .
         assert _sys.argv == ["mcmod-parser", "scan", "dir", "-f", ".", "-r", "-o", "csv"]
+
+
+# ---------------------------------------------------------------------------
+# Diff tests
+# ---------------------------------------------------------------------------
+
+def _make_mod(mod_id: str, version: str, display_name: str = "", loader: LoaderType = LoaderType.FABRIC) -> ModInfo:
+    return ModInfo(mod_id=mod_id, version=version, display_name=display_name, loader_type=loader)
+
+
+class TestFormatDiff:
+    def test_added(self) -> None:
+        old = {"a": _make_mod("a", "1.0")}
+        new = {"a": _make_mod("a", "1.0"), "b": _make_mod("b", "2.0")}
+        items = _format_diff(old, new, "/old", "/new")
+        added = [t for t, c in items if c == "green" and t.startswith("+")]
+        assert any("b" in t for t in added)
+
+    def test_removed(self) -> None:
+        old = {"a": _make_mod("a", "1.0"), "b": _make_mod("b", "2.0")}
+        new = {"a": _make_mod("a", "1.0")}
+        items = _format_diff(old, new, "/old", "/new")
+        removed = [t for t, c in items if c == "red" and t.startswith("-")]
+        assert any("b" in t for t in removed)
+
+    def test_version_changed(self) -> None:
+        old = {"a": _make_mod("a", "1.0")}
+        new = {"a": _make_mod("a", "2.0")}
+        items = _format_diff(old, new, "/old", "/new")
+        lines_red = [t for t, c in items if c == "red" and "a" in t]
+        lines_green = [t for t, c in items if c == "green" and "a" in t]
+        assert len(lines_red) == 1 and "1.0" in lines_red[0]
+        assert len(lines_green) == 1 and "2.0" in lines_green[0]
+
+    def test_unchanged_not_shown(self) -> None:
+        old = {"a": _make_mod("a", "1.0")}
+        new = {"a": _make_mod("a", "1.0")}
+        items = _format_diff(old, new, "/old", "/new")
+        body = [t for t, c in items if c in ("green", "red")]
+        assert body == []  # no diff lines for unchanged
+
+    def test_empty_both(self) -> None:
+        items = _format_diff({}, {}, "/old", "/new")
+        assert items == [("Both directories contain no mods.", None)]
+
+    def test_header_labels(self) -> None:
+        items = _format_diff(
+            {"a": _make_mod("a", "1.0")}, {"a": _make_mod("a", "2.0")},
+            "/mods/v1", "/mods/v2",
+        )
+        texts = [t for t, _ in items]
+        assert any("--- /mods/v1" in t for t in texts)
+        assert any("+++ /mods/v2" in t for t in texts)
+
+    def test_summary_counts(self) -> None:
+        old = {"a": _make_mod("a", "1.0"), "c": _make_mod("c", "1.0")}
+        new = {"b": _make_mod("b", "2.0"), "c": _make_mod("c", "3.0")}
+        items = _format_diff(old, new, "/old", "/new")
+        summary = [t for t, c in items if "added" in t and c is None]
+        assert len(summary) == 1
+        assert "+1 added" in summary[0]
+        assert "-1 removed" in summary[0]
+        assert "~1 changed" in summary[0]
+
+
+class TestRenderDiff:
+    def test_colored(self) -> None:
+        items = [("+ added", "green"), ("- removed", "red")]
+        out = _render_diff(items, colored=True)
+        assert "\033[" in out  # ANSI escape present
+
+    def test_no_color(self) -> None:
+        items = [("+ added", "green"), ("- removed", "red")]
+        out = _render_diff(items, colored=False)
+        assert "\033[" not in out
+        assert "+ added" in out
+        assert "- removed" in out
+
+
+class TestCLIDiff:
+    def test_diff_basic(self, tmp_path) -> None:
+        runner = CliRunner()
+        dir_a = tmp_path / "mods_a"
+        dir_b = tmp_path / "mods_b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        (dir_a / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "shared", "version": "1.0",
+        }))
+        (dir_a / "mod1.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "only_in_a", "version": "1.0",
+        }))
+
+        (dir_b / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "shared", "version": "2.0",
+        }))
+        (dir_b / "mod2.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "only_in_b", "version": "3.0",
+        }))
+
+        result = runner.invoke(main, ["diff", str(dir_a), str(dir_b)])
+        assert result.exit_code == 0
+        assert "only_in_a" in result.output
+        assert "only_in_b" in result.output
+        # shared version changed: 1.0 → 2.0
+        assert "shared" in result.output
+
+    def test_diff_no_color(self, tmp_path) -> None:
+        runner = CliRunner()
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        (dir_a / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "m", "version": "1.0",
+        }))
+        (dir_b / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "m", "version": "2.0",
+        }))
+
+        result = runner.invoke(main, ["diff", str(dir_a), str(dir_b), "--no-color"])
+        assert result.exit_code == 0
+        assert "\033[" not in result.output  # no ANSI codes
+        assert "m" in result.output
+        assert "1.0" in result.output
+        assert "2.0" in result.output
+
+    def test_diff_output_file(self, tmp_path) -> None:
+        runner = CliRunner()
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        (dir_a / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "m", "version": "1.0",
+        }))
+        (dir_b / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "m", "version": "1.0",
+        }))
+
+        out_f = tmp_path / "diff.txt"
+        result = runner.invoke(main, [
+            "diff", str(dir_a), str(dir_b),
+            "--output-file", str(out_f),
+        ])
+        assert result.exit_code == 0
+        assert out_f.is_file()
+        content = out_f.read_text(encoding="utf-8")
+        assert "m" in content
+
+    def test_diff_empty_dirs(self, tmp_path) -> None:
+        runner = CliRunner()
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        result = runner.invoke(main, ["diff", str(dir_a), str(dir_b)])
+        assert result.exit_code == 0
+        assert "no mods" in result.output.lower()
+
+    def test_diff_loader_filter(self, tmp_path) -> None:
+        runner = CliRunner()
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+
+        # Fabric mod
+        (dir_a / "fabric.mod.json").write_text(json.dumps({
+            "schemaVersion": 1, "id": "fabric_mod", "version": "1.0",
+        }))
+        # Forge mod
+        (dir_a / "mods.toml").write_text("""\
+license = "MIT"
+[[mods]]
+modId = "forge_mod"
+version = "1.0"
+""")
+        (dir_b / "mods.toml").write_text("""\
+license = "MIT"
+[[mods]]
+modId = "forge_mod"
+version = "2.0"
+""")
+
+        # Only compare forge mods
+        result = runner.invoke(main, [
+            "diff", str(dir_a), str(dir_b), "--loader", "forge",
+        ])
+        assert result.exit_code == 0
+        assert "forge_mod" in result.output
+        assert "fabric_mod" not in result.output
+
+    def test_diff_help(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["diff", "--help"])
+        assert result.exit_code == 0
+        assert "DIR_A" in result.output
+        assert "--no-color" in result.output
+        assert "--recursive" in result.output
