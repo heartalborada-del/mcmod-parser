@@ -97,7 +97,7 @@ def _format_text(mods: list) -> str:
 def _format_csv(mods: list) -> str:
     """Format mod list as CSV."""
     output = io.StringIO()
-    writer = csv.writer(output)
+    writer = csv.writer(output, lineterminator="\n")
     writer.writerow(["Loader", "ModID", "Version", "DisplayName", "Authors", "License", "Dependencies"])
     for m in mods:
         deps = "; ".join(f"{d.mod_id}:{d.version_range}" for d in m.dependencies)
